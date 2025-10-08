@@ -26,13 +26,13 @@ STYLE_DEFAULT = {
     "info_artist_line_height_base": 67,
     "info_title_wrap_gap_base": 16,  # trackName 折返し行間
 
-    # フォント（固定px）
+    # フォント（固定px） 
     "track_font_px": 170,
     "artist_font_px": 50,
     "lyric_font_px": 120,
 
     # 歌詞レイアウト（固定px）
-    "lyric_line_height": 150,
+    "lyric_line_height": 200,
     "lyric_intra_row_gap": 10,    # 同一 words 内の折返し行間
     "lyric_inter_line_gap": 75,  # 別 words 間の行間
 
@@ -1263,6 +1263,22 @@ def make(
     print("")
     proc.stdin.close()
     proc.wait()
+    # --- ここから追記: 最後の情報表示をPNGでサムネイル保存 ---
+    thumb_name = f"{safe_filename(track)} - {safe_filename(artist)}.png"
+
+    # 背景を塗り直し、情報表示のみをフル不透明で描画
+    renderer.begin(bg)
+    renderer.draw_image(renderer.img_vbo, renderer.jacket_tex, 1.0, side, STYLE["jacket_corner_radius_px"])
+    for dx, dy in shadow_offsets:
+        renderer.draw_text_full(renderer.text_vbo_info, shadow_per_tap_alpha, 0.0, 0.0, static=True, offset=(dx, dy), shadow=True)
+    renderer.draw_text_full(renderer.text_vbo_info, 1.0, 0.0, 0.0, static=True)
+
+    # フレーム読み出し→PNG保存
+    rgb = renderer.read_rgb()  # 既存がRGB24を返す前提
+    Image.frombytes("RGB", (W, H), rgb).save(thumb_name, "PNG")
+    print(f"Thumbnail saved: {thumb_name}")
+    # --- 追記ここまで ---
+
     print(f"Done: {out_name}")
     return out_name
 
