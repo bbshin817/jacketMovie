@@ -20,7 +20,7 @@ STYLE_DEFAULT = {
     "pad_y_base": 120,   # ↑↓
 
     # 情報表示（解像度に相対）
-    "info_gap_x_base": 48,      # ジャケットとテキストの水平ギャップ
+    "info_gap_x_base": 75,      # ジャケットとテキストの水平ギャップ
     "info_line_gap_base": 50,   # track と artist の縦ギャップ
     "info_title_line_height_base": 170,
     "info_artist_line_height_base": 67,
