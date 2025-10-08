@@ -1,13 +1,5 @@
 # lyricVideo.py
-import sys
-import os
-import re
-import json
-import math
-import subprocess
-import shutil
-import tempfile
-import time
+import sys, os, re, json, math, subprocess, shutil, tempfile, time
 from typing import Tuple, List, Dict, Optional
 import numpy as np
 from PIL import Image, ImageStat
@@ -20,12 +12,12 @@ import freetype
 # スタイル（既定値／1920x1080基準）
 # =========================
 STYLE_DEFAULT = {
-    "output_fps": 60,
-    "internal_render_fps": 60,
+    "output_fps": 30,
+    "internal_render_fps": 30,
 
     # パディング（解像度に相対：左右=100, 上下=150）
     "pad_x_base": 100,   # ←→
-    "pad_y_base": 150,   # ↑↓
+    "pad_y_base": 120,   # ↑↓
 
     # 情報表示（解像度に相対）
     "info_gap_x_base": 48,      # ジャケットとテキストの水平ギャップ
@@ -36,24 +28,27 @@ STYLE_DEFAULT = {
 
     # フォント（固定px）
     "track_font_px": 170,
-    "artist_font_px": 67,
+    "artist_font_px": 50,
     "lyric_font_px": 120,
 
     # 歌詞レイアウト（固定px）
     "lyric_line_height": 150,
-    "lyric_intra_row_gap": 50,    # 同一 words 内の折返し行間
-    "lyric_inter_line_gap": 100,  # 別 words 間の行間
+    "lyric_intra_row_gap": 10,    # 同一 words 内の折返し行間
+    "lyric_inter_line_gap": 75,  # 別 words 間の行間
 
     # ジャケット
     "jacket_corner_radius_px": 20,
     "jacket_side_ratio": 256.0 / 1080.0,  # 1920x1080で256px相当
 
-    # ディゾルブ（ease-in-out）
-    "fade_sec": 1.0,        # 情報→歌詞
-    "final_wait_sec": 1.0,  # 最終行終了→情報へ戻る待機
-    "final_fade_sec": 2.0,  # 歌詞→情報
+    # ディゾルブ
+    "fade_sec": 1.0,              # 冒頭：情報→歌詞（ease-in-out）
+    "final_wait_sec": 1.0,        # 最終行 end の1秒後に情報表示
+    "final_fade_sec": 1.0,        # 情報表示のディゾルブ 1秒
 
-    # 文節グラデーション境界の半幅（ピクセル）← 統一幅（新設）
+    # 最終行のフェードアウト（最終行 end 到達時に開始）
+    "last_line_fade_sec": 1.0,
+
+    # 文節グラデーション境界の半幅（ピクセル）← 統一幅
     "syllable_edge_blur_px": 75.0,
 
     # NVENC
@@ -74,16 +69,21 @@ STYLE_DEFAULT = {
         "-loglevel", "error"
     ],
 
-    # box-shadow: 0 0 50px 2.5px rgba(0,0,0,0.1) 近似
+    # box-shadow 近似
     "shadow_blur_px": 50.0,
     "shadow_spread_px": 1,
-    "shadow_alpha": 0.25
+    "shadow_alpha": 0.25,
+    
+    "audio_delay" : 0.3
 }
 
 # プロジェクト直下の "fonts" ディレクトリを優先して探索
 BASE_DIR = os.path.dirname(__file__)
 FONT_DIR = os.path.join(BASE_DIR, "fonts")
 
+# =========================
+# ユーティリティ
+# =========================
 
 def _pick_font(candidates: list[str]) -> Optional[str]:
     for name in candidates:
@@ -98,32 +98,23 @@ def _pick_font(candidates: list[str]) -> Optional[str]:
             return q
     return None
 
-# =========================
-# ユーティリティ
-# =========================
-
-
 def parse_resolution(text: str) -> Tuple[int, int]:
     if not text:
         return 1920, 1080
     m = re.match(r"^(\d+)[xX](\d+)$", text)
-    return (1920, 1080) if not m else (int(m.group(1)), int(m.group(2)))
-
+    return (1920,1080) if not m else (int(m.group(1)), int(m.group(2)))
 
 def clamp_int(v: float, lo: int, hi: int) -> int:
     return int(max(lo, min(hi, round(v))))
 
-
 def safe_filename(name: str) -> str:
     return re.sub(r"[\\/:*?\"<>|]+", "_", name).strip() or "output"
 
-
-def avg_color_with_clamp(jacket_path: str) -> Tuple[int, int, int]:
+def avg_color_with_clamp(jacket_path: str) -> Tuple[int,int,int]:
     img = Image.open(jacket_path).convert("RGB")
     stat = ImageStat.Stat(img)
     r, g, b = stat.mean
-    return clamp_int(r, 50, 230), clamp_int(g, 50, 230), clamp_int(b, 50, 230)
-
+    return clamp_int(r,50,230), clamp_int(g,50,230), clamp_int(b,50,230)
 
 def cubic_bezier(x: float, x1: float, y1: float, x2: float, y2: float) -> float:
     def bez(u, a, b): return 3*(1-u)*(1-u)*u*a + 3*(1-u)*u*u*b + u*u*u
@@ -131,25 +122,19 @@ def cubic_bezier(x: float, x1: float, y1: float, x2: float, y2: float) -> float:
     x = max(0.0, min(1.0, x))
     for _ in range(20):
         mid = (lo + hi)/2
-        if bez(mid, x1, x2) < x:
-            lo = mid
-        else:
-            hi = mid
+        if bez(mid, x1, x2) < x: lo = mid
+        else: hi = mid
     u = (lo + hi)/2
     return bez(u, y1, y2)
-
 
 def ease(x: float) -> float:
     return cubic_bezier(x, 0.25, 0.1, 0.25, 1.0)
 
-
 def ease_in_out(x: float) -> float:
     return cubic_bezier(x, 0.42, 0.0, 0.58, 1.0)
 
-
 def is_ascii_like(ch: str) -> bool:
     return bool(re.match(r"^[ -~]$", ch))
-
 
 def ensure_ttf(font_path: str) -> Optional[str]:
     if not os.path.isfile(font_path):
@@ -163,8 +148,7 @@ def ensure_ttf(font_path: str) -> Optional[str]:
             import brotli  # noqa
             out_dir = os.path.join(tempfile.gettempdir(), "font_cache_gl")
             os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, safe_filename(
-                os.path.basename(font_path)) + ".ttf")
+            out_path = os.path.join(out_dir, safe_filename(os.path.basename(font_path)) + ".ttf")
             if not os.path.isfile(out_path):
                 tt = TTFont(font_path)
                 tt.flavor = None
@@ -174,7 +158,6 @@ def ensure_ttf(font_path: str) -> Optional[str]:
             print(f"[warn] WOFF2変換失敗: {e}")
             return None
     return None
-
 
 def ffprobe_duration_seconds(path: str) -> float:
     ffprobe = shutil.which("ffprobe")
@@ -190,129 +173,113 @@ def ffprobe_duration_seconds(path: str) -> float:
         return 0.0
 
 # =========================
+# words単位の時間整形（重なり解消）
+# =========================
+def normalize_words_timing(lines: List[dict]) -> None:
+    """
+    現在の行 endTimeMs > 次の行 startTimeMs の場合、
+    現在行の endTimeMs を「次の行の endTimeMs」に置換します（words単位）。
+    ※ in-place に書き換えます。
+    """
+    n = len(lines)
+    for i in range(n - 1):
+        cur_end = int(lines[i].get("endTimeMs", 0))
+        nxt_start = int(lines[i+1].get("startTimeMs", 0))
+        if cur_end > nxt_start:
+            nxt_end = int(lines[i+1].get("endTimeMs", cur_end))
+            lines[i]["endTimeMs"] = nxt_end
+
+# =========================
 # フォントアトラス
 # =========================
-
-
 class GlyphInfo:
-    __slots__ = ("u0", "v0", "u1", "v1", "w", "h",
-                 "bearing_x", "bearing_y", "advance")
-
-    def __init__(self, u0, v0, u1, v1, w, h, bx, by, adv):
-        self.u0, self.v0, self.u1, self.v1 = u0, v0, u1, v1
-        self.w, self.h = w, h
-        self.bearing_x, self.bearing_y = bx, by
+    __slots__ = ("u0","v0","u1","v1","w","h","bearing_x","bearing_y","advance")
+    def __init__(self,u0,v0,u1,v1,w,h,bx,by,adv):
+        self.u0,self.v0,self.u1,self.v1 = u0,v0,u1,v1
+        self.w,self.h = w,h
+        self.bearing_x,self.bearing_y = bx,by
         self.advance = adv
 
-
 class FontKey:
-    __slots__ = ("path", "size")
-
-    def __init__(self, path: str, size: int):
-        self.path = path
-        self.size = size
-
-    def __hash__(self): return hash((self.path, self.size))
-    def __eq__(self, o): return isinstance(
-        o, FontKey) and o.path == self.path and o.size == self.size
-
+    __slots__=("path","size")
+    def __init__(self,path: str,size: int):
+        self.path=path; self.size=size
+    def __hash__(self): return hash((self.path,self.size))
+    def __eq__(self,o): return isinstance(o,FontKey) and o.path==self.path and o.size==self.size
 
 class AtlasPacker:
-    def __init__(self, width=4096, height=4096, padding=2):
-        self.W, self.H = width, height
-        self.pad = padding
-        self.img = Image.new("L", (width, height), 0)
-        self.cx = self.pad
-        self.cy = self.pad
-        self.shelf_h = 0
-
-    def add_bitmap(self, bmp: Image.Image) -> Tuple[int, int]:
-        w, h = bmp.size
-        if self.cx+w+self.pad > self.W:
-            self.cx = self.pad
-            self.cy += self.shelf_h+self.pad
-            self.shelf_h = 0
-        if h > self.shelf_h:
-            self.shelf_h = h
-        if self.cy+h+self.pad > self.H:
+    def __init__(self,width=4096,height=4096,padding=2):
+        self.W,self.H=width,height
+        self.pad=padding
+        self.img=Image.new("L",(width,height),0)
+        self.cx=self.pad; self.cy=self.pad; self.shelf_h=0
+    def add_bitmap(self,bmp:Image.Image)->Tuple[int,int]:
+        w,h=bmp.size
+        if self.cx+w+self.pad>self.W:
+            self.cx=self.pad
+            self.cy+=self.shelf_h+self.pad
+            self.shelf_h=0
+        if h>self.shelf_h: self.shelf_h=h
+        if self.cy+h+self.pad>self.H:
             raise RuntimeError("フォントアトラスが溢れました（4096x4096超）。")
-        self.img.paste(bmp, (self.cx, self.cy))
-        x, y = self.cx, self.cy
-        self.cx += w+self.pad
-        return x, y
-
+        self.img.paste(bmp,(self.cx,self.cy))
+        x,y=self.cx,self.cy
+        self.cx+=w+self.pad
+        return x,y
 
 class FontAtlas:
     def __init__(self):
-        self.glyphs: Dict[Tuple["FontKey", str], GlyphInfo] = {}
+        self.glyphs: Dict[Tuple["FontKey",str], GlyphInfo] = {}
         self.packer = AtlasPacker()
         self.faces: Dict["FontKey", freetype.Face] = {}
-
-    def _load_face(self, key: "FontKey") -> freetype.Face:
-        if key in self.faces:
-            return self.faces[key]
-        face = freetype.Face(key.path)
+    def _load_face(self,key:"FontKey")->freetype.Face:
+        if key in self.faces: return self.faces[key]
+        face=freetype.Face(key.path)
         face.set_char_size(key.size*64)
-        self.faces[key] = face
+        self.faces[key]=face
         return face
-
-    def add_text(self, key: "FontKey", text: str):
-        face = self._load_face(key)
+    def add_text(self,key:"FontKey",text:str):
+        face=self._load_face(key)
         for ch in text:
-            k = (key, ch)
-            if k in self.glyphs:
+            k=(key,ch)
+            if k in self.glyphs: continue
+            face.load_char(ch, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_NORMAL)
+            glyph=face.glyph
+            bmp=glyph.bitmap
+            w,h=bmp.width,bmp.rows
+            if w==0 or h==0:
+                gi=GlyphInfo(0,0,0,0,0,0,glyph.bitmap_left,glyph.bitmap_top,glyph.advance.x/64.0)
+                self.glyphs[k]=gi
                 continue
-            face.load_char(ch, freetype.FT_LOAD_RENDER |
-                           freetype.FT_LOAD_TARGET_NORMAL)
-            glyph = face.glyph
-            bmp = glyph.bitmap
-            w, h = bmp.width, bmp.rows
-            if w == 0 or h == 0:
-                gi = GlyphInfo(0, 0, 0, 0, 0, 0, glyph.bitmap_left,
-                               glyph.bitmap_top, glyph.advance.x/64.0)
-                self.glyphs[k] = gi
-                continue
-            buf = np.array(bmp.buffer, dtype=np.uint8).reshape((h, w))
-            im = Image.fromarray(buf)  # mode 省略（Deprecation回避）
-            x, y = self.packer.add_bitmap(im)
-            u0, v0, u1, v1 = x/self.packer.W, y / \
-                self.packer.H, (x+w)/self.packer.W, (y+h)/self.packer.H
-            gi = GlyphInfo(u0, v0, u1, v1, w, h, glyph.bitmap_left,
-                           glyph.bitmap_top, glyph.advance.x/64.0)
-            self.glyphs[k] = gi
-
-    def finalize_gl(self, ctx: moderngl.Context) -> moderngl.Texture:
-        tex = ctx.texture((self.packer.W, self.packer.H),
-                          1, self.packer.img.tobytes())
-        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        tex.swizzle = "RRRR"
+            buf=np.array(bmp.buffer,dtype=np.uint8).reshape((h,w))
+            im=Image.fromarray(buf)  # mode 省略（Deprecation回避）
+            x,y=self.packer.add_bitmap(im)
+            u0,v0,u1,v1 = x/self.packer.W, y/self.packer.H, (x+w)/self.packer.W, (y+h)/self.packer.H
+            gi=GlyphInfo(u0,v0,u1,v1,w,h,glyph.bitmap_left,glyph.bitmap_top,glyph.advance.x/64.0)
+            self.glyphs[k]=gi
+    def finalize_gl(self,ctx:moderngl.Context)->moderngl.Texture:
+        tex=ctx.texture((self.packer.W,self.packer.H),1,self.packer.img.tobytes())
+        tex.filter=(moderngl.LINEAR,moderngl.LINEAR)
+        tex.swizzle="RRRR"
         return tex
 
 # =========================
 # レイアウト構造
 # =========================
-
-
 class RenderRow:
-    def __init__(self, char_indices: List[int], width: float):
-        self.char_indices = char_indices
-        self.width = width
-
+    def __init__(self,char_indices:List[int],width:float):
+        self.char_indices=char_indices
+        self.width=width
 
 class RenderLine:
-    def __init__(self, idx: int, start: float, end: float, text: str, has_syll: bool):
-        self.index = idx
-        self.start = start
-        self.end = end
-        self.text = text
-        self.has_syll = has_syll
-        self.rows: List[RenderRow] = []
-        self.block_height: int = 0
-        self.char_times: List[Tuple[float, float]] = []  # 各文字の (start,end)
-
+    def __init__(self,idx:int,start:float,end:float,text:str,has_syll:bool):
+        self.index=idx; self.start=start; self.end=end; self.text=text; self.has_syll=has_syll
+        self.rows:List[RenderRow]=[]
+        self.block_height:int=0
+        self.char_times:List[Tuple[float,float]]=[]  # 各文字の (start,end)
 
 # =========================
-# OpenGL Shaders（文節全体マスクの連続グラデーション）
+# Shaders（文節マスク連続グラデーション）
 # =========================
 TEXT_VS = """
 #version 330
@@ -335,7 +302,7 @@ uniform vec2 u_offset;
 uniform float u_shadow;
 
 out vec2 v_uv;
-out float v_px;    // フラグメントの X（px）
+out float v_px;
 out float v_st;
 out float v_et;
 out float v_s0;
@@ -425,7 +392,7 @@ void main(){
             mixv = 1.0 - smoothstep(a, b, nx);
         }
     }else{
-        // syllables なし：行全体の0.5秒フェード
+        // syllables なし：行全体の0.5秒フェード（出現）
         float prog = 0.0;
         if(u_time <= v_st)      prog = 0.0;
         else if(u_time >= v_et) prog = 1.0;
@@ -488,9 +455,7 @@ void main(){
 # =========================
 # 混在テキストの折り返し（英単語優先）
 # =========================
-_TOKEN_RE = re.compile(
-    r"\s+|[A-Za-z0-9]+(?:[\'\-][A-Za-z0-9]+)*|.", re.UNICODE)
-
+_TOKEN_RE = re.compile(r"\s+|[A-Za-z0-9]+(?:[\'\-][A-Za-z0-9]+)*|.", re.UNICODE)
 
 def wrap_mixed_by_width(text: str, content_w: float, advance_of) -> List[List[int]]:
     if text == "":
@@ -569,13 +534,10 @@ def wrap_mixed_by_width(text: str, content_w: float, advance_of) -> List[List[in
 # =========================
 # レイアウト（歌詞：混在折り返し + 文節情報）
 # =========================
-
-
 class RenderBuildResult:
     def __init__(self, lines: List[RenderLine], line_height: int):
         self.lines = lines
         self.line_height = line_height
-
 
 def build_render_lines(
     lyric_json: List[dict],
@@ -603,7 +565,7 @@ def build_render_lines(
         start = item.get("startTimeMs", 0)/1000.0
         end = item.get("endTimeMs", 0)/1000.0
         syllables = item.get("syllables", []) or []
-        rl = RenderLine(idx, start, end, text, len(syllables) > 0)
+        rl = RenderLine(idx, start, end, text, len(syllables)>0)
 
         # 文字ごとの時間
         if rl.has_syll and text != "":
@@ -618,7 +580,7 @@ def build_render_lines(
             rl.char_times = []
             for i in range(len(text)):
                 st, et = rl.start, rl.start + 0.5
-                for a, b, s, e in spans:
+                for a,b,s,e in spans:
                     if a <= i < b:
                         st, et = s, e
                         break
@@ -628,7 +590,7 @@ def build_render_lines(
         else:
             rl.char_times = []
 
-        # 折り返し（まずは「行＝インデックス配列」）
+        # 折り返し
         rows_idx = wrap_mixed_by_width(text, content_w, char_advance)
         rl.rows = []
         for idxs in rows_idx:
@@ -639,8 +601,7 @@ def build_render_lines(
         if text == "":
             rl.block_height = 0
         else:
-            rl.block_height = len(rl.rows)*lh + \
-                max(0, len(rl.rows)-1)*gap_intra
+            rl.block_height = len(rl.rows)*lh + max(0, len(rl.rows)-1)*gap_intra
 
         render_lines.append(rl)
 
@@ -649,37 +610,31 @@ def build_render_lines(
 # =========================
 # OpenGL Renderer
 # =========================
-
-
 class GLRenderer:
-    def __init__(self, W: int, H: int, bg_rgb: Tuple[int, int, int], style: Dict[str, float]):
-        self.W, self.H = W, H
+    def __init__(self, W:int, H:int, bg_rgb:Tuple[int,int,int], style:Dict[str, float]):
+        self.W,self.H=W,H
         self.style = style
-        config = pyglet.gl.Config(
-            double_buffer=False, alpha_size=8, depth_size=0, stencil_size=0)
-        self.window = pyglet.window.Window(
-            width=W, height=H, visible=False, config=config)
+        config = pyglet.gl.Config(double_buffer=False, alpha_size=8, depth_size=0, stencil_size=0)
+        self.window = pyglet.window.Window(width=W, height=H, visible=False, config=config)
         self.ctx = moderngl.create_context()
-        self.fbo = self.ctx.simple_framebuffer((W, H))
+        self.fbo = self.ctx.simple_framebuffer((W,H))
         self.fbo.use()
 
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
-        self.prog_text = self.ctx.program(
-            vertex_shader=TEXT_VS, fragment_shader=TEXT_FS)
-        self.prog_img = self.ctx.program(
-            vertex_shader=IMG_VS,  fragment_shader=IMG_FS)
+        self.prog_text = self.ctx.program(vertex_shader=TEXT_VS, fragment_shader=TEXT_FS)
+        self.prog_img  = self.ctx.program(vertex_shader=IMG_VS,  fragment_shader=IMG_FS)
 
-        self.prog_text["u_view"].value = (W, H)
+        self.prog_text["u_view"].value = (W,H)
         self.prog_text["u_time"].value = 0.0
         self.prog_text["u_scroll"].value = 0.0
         self.prog_text["u_alpha"].value = 1.0
         self.prog_text["u_offset"].value = (0.0, 0.0)
         self.prog_text["u_shadow"].value = 0.0
-        self.prog_text["u_static"].value = 0.0  # 初期値
+        self.prog_text["u_static"].value = 0.0
 
-        self.prog_img["u_view"].value = (W, H)
+        self.prog_img["u_view"].value = (W,H)
         self.prog_img["u_alpha"].value = 1.0
         self.prog_img["u_size"].value = (0.0, 0.0)
         self.prog_img["u_radius"].value = 0.0
@@ -690,7 +645,8 @@ class GLRenderer:
         self.img_vbo = None
         self.jacket_tex = None
 
-        self.lyric_ranges: List[Tuple[int, int, float, float]] = []
+        # (first, count, row_top, row_bottom, is_last_row:int)
+        self.lyric_ranges: List[Tuple[int,int,float,float,int]] = []
 
     def upload_atlas(self, atlas_tex: moderngl.Texture):
         self.atlas_tex = atlas_tex
@@ -699,9 +655,9 @@ class GLRenderer:
         self,
         atlas: "FontAtlas",
         items: List[dict],
-        row_height_for_bounds: Optional[int] = None,
-        record_ranges: bool = False,
-        baseline_to_top_px: Optional[int] = None
+        row_height_for_bounds: Optional[int]=None,
+        record_ranges: bool=False,
+        baseline_to_top_px: Optional[int]=None
     ) -> moderngl.Buffer:
         """
         items 要素:
@@ -712,41 +668,43 @@ class GLRenderer:
             "char_times": Optional[List[(st,et)]],
 
             # 文節グラデーション用（任意・無ければ0で描画）
-            "syl_s0": Optional[List[float]],   # 文節開始時刻（文字ごとに同一値）
-            "syl_s1": Optional[List[float]],   # 文節終了時刻
-            "syl_sx0": Optional[List[float]],  # 文節 左端X（px）
-            "syl_sx1": Optional[List[float]],  # 文節 右端X（px）
-            "syl_blur": Optional[List[float]], # 正規化ぼかし半幅
-            "syl_has": Optional[List[float]]   # 1.0 / 0.0
+            "syl_s0": Optional[List[float]],
+            "syl_s1": Optional[List[float]],
+            "syl_sx0": Optional[List[float]],
+            "syl_sx1": Optional[List[float]],
+            "syl_blur": Optional[List[float]],
+            "syl_has": Optional[List[float]],
+
+            # 最終行の行かどうか（行単位）
+            "is_last_row": Optional[bool]
           }
         """
-        verts = []
-        ranges = []
+        verts=[]
+        ranges=[]
         first_vertex = 0
 
-        def glyph_of(k: "FontKey", ch: str) -> Optional[GlyphInfo]:
+        def glyph_of(k:"FontKey", ch:str) -> Optional[GlyphInfo]:
             return atlas.glyphs.get((k, ch))
 
         for it in items:
-            x = float(it["x"])
-            y = float(it["y"])
-            text = it["text"]
-            times = it.get("char_times")
+            x=float(it["x"]); y=float(it["y"])
+            text=it["text"]
+            times=it.get("char_times")
 
             s0s = it.get("syl_s0")
             s1s = it.get("syl_s1")
-            sx0s = it.get("syl_sx0")
-            sx1s = it.get("syl_sx1")
+            sx0s= it.get("syl_sx0")
+            sx1s= it.get("syl_sx1")
             sbl = it.get("syl_blur")
             shs = it.get("syl_has")
 
             font_keys: Optional[List["FontKey"]] = it.get("font_keys")
             single_key: Optional["FontKey"] = it.get("font_key")
 
-            cx = x
+            cx=x
             begin = first_vertex
 
-            for i, ch in enumerate(text):
+            for i,ch in enumerate(text):
                 k = font_keys[i] if font_keys else single_key
                 if not k:
                     continue
@@ -758,7 +716,7 @@ class GLRenderer:
                 y0 = y - gi.bearing_y
                 x1 = x0 + gi.w
                 y1 = y0 + gi.h
-                u0, v0, u1, v1 = gi.u0, gi.v0, gi.u1, gi.v1
+                u0,v0,u1,v1 = gi.u0,gi.v0,gi.u1,gi.v1
 
                 st, et = (0.0, 0.0)
                 if times and i < len(times):
@@ -769,13 +727,11 @@ class GLRenderer:
                 xs0 = sx0s[i] if sx0s else 0.0
                 xs1 = sx1s[i] if sx1s else 1.0
                 sbr = sbl[i] if sbl else 0.0
-                sh = shs[i] if shs else 0.0
+                sh  = shs[i] if shs else 0.0
 
-                # 6頂点（三角形2）
-                for vx, vy, uu, vv in [(x0, y0, u0, v0), (x1, y0, u1, v0), (x1, y1, u1, v1),
-                                       (x0, y0, u0, v0), (x1, y1, u1, v1), (x0, y1, u0, v1)]:
-                    verts.extend(
-                        [vx, vy, uu, vv, st, et, ss0, ss1, xs0, xs1, sbr, sh])
+                for vx,vy,uu,vv in [(x0,y0,u0,v0),(x1,y0,u1,v0),(x1,y1,u1,v1),
+                                    (x0,y0,u0,v0),(x1,y1,u1,v1),(x0,y1,u0,v1)]:
+                    verts.extend([vx,vy, uu,vv, st,et, ss0,ss1, xs0,xs1, sbr,sh])
                 cx += gi.advance
                 first_vertex += 6
 
@@ -783,7 +739,8 @@ class GLRenderer:
             if record_ranges and row_height_for_bounds is not None and baseline_to_top_px is not None:
                 row_top = y - baseline_to_top_px
                 row_bottom = row_top + row_height_for_bounds
-                ranges.append((begin, count, row_top, row_bottom))
+                is_last = 1 if it.get("is_last_row", False) else 0
+                ranges.append((begin, count, row_top, row_bottom, is_last))
 
         data = np.array(verts, dtype="f4").tobytes()
         vbo = self.ctx.buffer(data)
@@ -791,35 +748,34 @@ class GLRenderer:
             self.lyric_ranges = ranges
         return vbo
 
-    def build_jacket_geometry(self, x: int, y: int, w: int, h: int) -> moderngl.Buffer:
-        x0, y0, x1, y1 = float(x), float(y), float(x+w), float(y+h)
+    def build_jacket_geometry(self, x:int, y:int, w:int, h:int)->moderngl.Buffer:
+        x0,y0,x1,y1 = float(x),float(y),float(x+w),float(y+h)
         verts = [
-            x0, y0, 0.0, 0.0,
-            x1, y0, 1.0, 0.0,
-            x1, y1, 1.0, 1.0,
-            x0, y0, 0.0, 0.0,
-            x1, y1, 1.0, 1.0,
-            x0, y1, 0.0, 1.0
+            x0,y0, 0.0,0.0,
+            x1,y0, 1.0,0.0,
+            x1,y1, 1.0,1.0,
+            x0,y0, 0.0,0.0,
+            x1,y1, 1.0,1.0,
+            x0,y1, 0.0,1.0
         ]
-        return self.ctx.buffer(np.array(verts, dtype="f4").tobytes())
+        return self.ctx.buffer(np.array(verts,dtype="f4").tobytes())
 
-    def upload_jacket_image(self, jacket_path: str, side: int) -> moderngl.Texture:
-        img = Image.open(jacket_path).convert(
-            "RGBA").resize((side, side), Image.LANCZOS)
+    def upload_jacket_image(self, jacket_path:str, side:int)->moderngl.Texture:
+        img = Image.open(jacket_path).convert("RGBA").resize((side,side), Image.LANCZOS)
         tex = self.ctx.texture(img.size, 4, img.tobytes())
         tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         return tex
 
-    def begin(self, bg_rgb: Tuple[int, int, int]):
+    def begin(self, bg_rgb:Tuple[int,int,int]):
         pyg_gl.glDisable(pyg_gl.GL_SCISSOR_TEST)
         self.fbo.use()
         self.ctx.clear(bg_rgb[0]/255.0, bg_rgb[1]/255.0, bg_rgb[2]/255.0, 1.0)
 
-    def draw_text_full(self, vbo: moderngl.Buffer, alpha: float, t: float, scroll: float, static: bool, offset: Tuple[float, float] = (0.0, 0.0), shadow: bool = False):
+    def draw_text_full(self, vbo:moderngl.Buffer, alpha:float, t:float, scroll:float, static:bool, offset:Tuple[float,float]=(0.0,0.0), shadow:bool=False):
         vao = self.ctx.vertex_array(
             self.prog_text, [
                 (vbo, "2f 2f 1f 1f 1f 1f 1f 1f 1f 1f",
-                 "a_pos", "a_uv", "a_st", "a_et", "a_s0", "a_s1", "a_sx0", "a_sx1", "a_blur", "a_has")
+                 "a_pos","a_uv","a_st","a_et","a_s0","a_s1","a_sx0","a_sx1","a_blur","a_has")
             ]
         )
         self.prog_text["u_time"].value = float(t)
@@ -832,19 +788,18 @@ class GLRenderer:
         self.prog_text["u_tex"].value = 0
         vao.render(moderngl.TRIANGLES)
 
-    def draw_text_culled(self, vbo: moderngl.Buffer, alpha: float, t: float, scroll: float, y_clip_min: int, y_clip_max: int, overscan: int = 200):
+    def draw_text_culled(self, vbo:moderngl.Buffer, base_alpha:float, t:float, scroll:float, y_clip_min:int, y_clip_max:int, overscan:int=200, last_row_alpha:float=1.0):
         if not self.lyric_ranges:
-            self.draw_text_full(vbo, alpha, t, scroll, static=False)
+            self.draw_text_full(vbo, base_alpha, t, scroll, static=False)
             return
         vao = self.ctx.vertex_array(
             self.prog_text, [
                 (vbo, "2f 2f 1f 1f 1f 1f 1f 1f 1f 1f",
-                 "a_pos", "a_uv", "a_st", "a_et", "a_s0", "a_s1", "a_sx0", "a_sx1", "a_blur", "a_has")
+                 "a_pos","a_uv","a_st","a_et","a_s0","a_s1","a_sx0","a_sx1","a_blur","a_has")
             ]
         )
         self.prog_text["u_time"].value = float(t)
         self.prog_text["u_scroll"].value = float(scroll)
-        self.prog_text["u_alpha"].value = float(alpha)
         self.prog_text["u_offset"].value = (0.0, 0.0)
         self.prog_text["u_shadow"].value = 0.0
         self.prog_text["u_static"].value = 0.0
@@ -854,15 +809,17 @@ class GLRenderer:
         y_min = y_clip_min - overscan
         y_max = y_clip_max + overscan
 
-        for first, count, row_top, row_bottom in self.lyric_ranges:
+        for first, count, row_top, row_bottom, is_last in self.lyric_ranges:
             top = row_top - scroll
             bottom = row_bottom - scroll
             if bottom < y_min or top > y_max:
                 continue
+            a = base_alpha * (last_row_alpha if is_last == 1 else 1.0)
+            self.prog_text["u_alpha"].value = float(a)
             vao.render(moderngl.TRIANGLES, vertices=count, first=first)
 
-    def draw_image(self, vbo: moderngl.Buffer, tex: moderngl.Texture, alpha: float, side: int, corner_radius: float):
-        vao = self.ctx.simple_vertex_array(self.prog_img, vbo, "a_pos", "a_uv")
+    def draw_image(self, vbo:moderngl.Buffer, tex:moderngl.Texture, alpha:float, side:int, corner_radius:float):
+        vao = self.ctx.simple_vertex_array(self.prog_img, vbo, "a_pos","a_uv")
         self.prog_img["u_alpha"].value = float(alpha)
         self.prog_img["u_size"].value = (float(side), float(side))
         self.prog_img["u_radius"].value = float(corner_radius)
@@ -870,7 +827,7 @@ class GLRenderer:
         self.prog_img["u_tex"].value = 0
         vao.render(moderngl.TRIANGLES)
 
-    def read_rgb(self) -> bytes:
+    def read_rgb(self)->bytes:
         data = self.fbo.read(components=3, alignment=1)
         arr = np.frombuffer(data, dtype=np.uint8).reshape(self.H, self.W, 3)
         arr = np.flip(arr, axis=0).copy()
@@ -879,10 +836,8 @@ class GLRenderer:
 # =========================
 # 影オフセット生成（box-shadow近似）
 # =========================
-
-
-def make_shadow_offsets(blur_px: float, spread_px: float) -> List[Tuple[float, float]]:
-    offsets: List[Tuple[float, float]] = []
+def make_shadow_offsets(blur_px: float, spread_px: float) -> List[Tuple[float,float]]:
+    offsets: List[Tuple[float,float]] = []
     ring_count = max(6, int(blur_px / 6.0))
     radii = [0.0]
     if spread_px > 0:
@@ -900,70 +855,30 @@ def make_shadow_offsets(blur_px: float, spread_px: float) -> List[Tuple[float, f
             offsets.append((math.cos(a) * r, math.sin(a) * r))
     return offsets
 
-# =========================
-# スクロールイベント（“重なりグループ”終端まで待機）
-# =========================
-
-
-def build_scroll_events_wait_all(render_lines: List["RenderLine"], inter_gap: int) -> List[Tuple[float, float]]:
+def build_scroll_events(render_lines: List["RenderLine"], inter_gap: int) -> List[Tuple[float, float]]:
     """
-    表示中の行の終了時刻より前に *開始* した行は、その「全員の表示が終わる」まで
-    スクロールを発生させない。すなわち、開始時刻と終了時刻の“重なり”を
-    連鎖的に統合してグループ化し、グループの最終終了時刻に一括スクロールする。
-    返り値: [(event_time, displacement_px), ...]
+    各行は、自行の終了時刻に到達したときのみ単独でスクロールします。
+    - イベントは (event_time, displacement_px)
+    - displacement は「その行の block_height + inter_gap」
+    - 最後の行はスクロールしない（イベントを発行しない）
     """
     n = len(render_lines)
     events: List[Tuple[float, float]] = []
-    if n == 0:
+    if n <= 1:
         return events
 
-    last_idx = n - 1  # 最終行はスクロールさせない
-    i = 0
-    while i < n:
-        if i == last_idx:
-            break
-
-        # グループ初期化
-        group_start = i
-        group_end_time = render_lines[i].end
-        j = i
-
-        # “重なり”を連鎖的に拡張
-        # ルール: 次行の start <= 現グループの end ならグルーピングし、
-        # その行の end で group_end_time を更新。これを収束まで繰り返す。
-        while True:
-            extended = False
-            while j + 1 < n and render_lines[j + 1].start <= group_end_time:
-                j += 1
-                if render_lines[j].end > group_end_time:
-                    group_end_time = render_lines[j].end
-                extended = True
-                if j == last_idx:
-                    # 最終行が含まれても、グループ終端は last の end まで広がる
-                    # （スクロール自体では last は動かさない）
-                    pass
-            if not extended:
-                break
-
-        # このグループのスクロール量（最終行は含めない）
-        disp = 0.0
-        upper = min(j, last_idx)  # last_idx 自体は動かさない
-        for k in range(group_start, upper):
-            disp += render_lines[k].block_height + inter_gap
-
+    last_idx = n - 1
+    for i in range(0, last_idx):  # 最後の行は除外
+        line = render_lines[i]
+        disp = float(line.block_height + inter_gap)
         if disp > 0.0:
-            events.append((group_end_time, disp))
-
-        # 次グループへ
-        i = j + 1
+            events.append((line.end, disp))
 
     return events
 
 # =========================
 # 生成本体（モジュールAPI）
 # =========================
-
-
 def make(
     audio_path: str,
     lyric_path: str,
@@ -982,26 +897,46 @@ def make(
 
     with open(lyric_path, "r", encoding="utf-8") as f:
         lyric_data = json.load(f)
+
+    # ★ words単位の時間整形（ご要望ロジック）
+    normalize_words_timing(lyric_data)
+
     with open(info_path, "r", encoding="utf-8") as f:
         info_data = json.load(f)
-    track = info_data.get("trackName", "Unknown Track")
-    artist = info_data.get("artistName", "Unknown Artist")
+    track = info_data.get("trackName","Unknown Track")
+    artist = info_data.get("artistName","Unknown Artist")
 
     audio_sec = ffprobe_duration_seconds(audio_path)
-    first_start_ms = min([ln.get("startTimeMs", 0)
-                         for ln in lyric_data]) if lyric_data else 0
+    first_start_ms = min([ln.get("startTimeMs",0) for ln in lyric_data]) if lyric_data else 0
     first_start = first_start_ms/1000.0
 
-    last_end_sec = max([ln.get("endTimeMs", 0)
-                       for ln in lyric_data])/1000.0 if lyric_data else audio_sec
+    last_end_sec = max([ln.get("endTimeMs",0) for ln in lyric_data])/1000.0 if lyric_data else audio_sec
+
+    # 冒頭の情報→歌詞
     t_in = 0.0 if first_start < 5.0 else max(0.0, first_start - 5.0)
-    t_out = last_end_sec + STYLE["final_wait_sec"]
     fade_in_dur = STYLE["fade_sec"]
-    fade_out_dur = STYLE["final_fade_sec"]
-    total_sec = max(audio_sec + 2.0, t_out + fade_out_dur)
+
+    # 終端：最終行はスクロールしない + 最終行フェードアウト → 1秒後に情報表示を1秒でディゾルブ
+    t_info_in = last_end_sec + STYLE["final_wait_sec"]
+    info_fade_dur = STYLE["final_fade_sec"]
+    last_fade_dur = STYLE["last_line_fade_sec"]
+
+    # 全体尺（オーディオ末尾 + 安全マージン）
+    total_sec = max(audio_sec + STYLE["audio_delay"] + 2.0, t_info_in + info_fade_dur)
 
     sx = W / 1920.0
     sy = H / 1080.0
+    track_px = max(8, int(round(STYLE["track_font_px"]  * sx)))
+    artist_px = max(8, int(round(STYLE["artist_font_px"] * sx)))
+    lyric_px  = max(8, int(round(STYLE["lyric_font_px"]  * sx)))
+    lyric_line_height_scaled   = int(round(STYLE["lyric_line_height"]   * sx))
+    lyric_intra_row_gap_scaled = int(round(STYLE["lyric_intra_row_gap"] * sx))
+    lyric_inter_line_gap_scaled= int(round(STYLE["lyric_inter_line_gap"]* sx))
+
+    # STYLE に上書きして以降の処理に反映（レイアウト計算・カリング・スクロールなど全てに効く）
+    STYLE["lyric_line_height"]    = lyric_line_height_scaled
+    STYLE["lyric_intra_row_gap"]  = lyric_intra_row_gap_scaled
+    STYLE["lyric_inter_line_gap"] = lyric_inter_line_gap_scaled
     pad_x = int(round(STYLE["pad_x_base"] * sx))
     pad_y = int(round(STYLE["pad_y_base"] * sy))
     info_gap_x = int(round(STYLE["info_gap_x_base"] * sx))
@@ -1025,21 +960,18 @@ def make(
     ]) or "DejaVuSans.ttf"
 
     atlas = FontAtlas()
-    fk_info_title = FontKey(info_font_path, STYLE["track_font_px"])
-    fk_info_artist = FontKey(info_font_path, STYLE["artist_font_px"])
-    fk_lyric_jp = FontKey(jp_font_path,   STYLE["lyric_font_px"])
-    fk_lyric_lat = FontKey(lat_font_path,  STYLE["lyric_font_px"])
+    fk_info_title = FontKey(info_font_path, track_px)
+    fk_info_artist= FontKey(info_font_path, artist_px)
+    fk_lyric_jp   = FontKey(jp_font_path,   lyric_px)
+    fk_lyric_lat  = FontKey(lat_font_path,  lyric_px)
 
     info_chars = set((track or "") + (artist or ""))
-    lyric_chars = set("".join([ln.get("words", "")
-                      for ln in lyric_data if ln.get("words", "") != ""]))
+    lyric_chars = set("".join([ln.get("words","") for ln in lyric_data if ln.get("words","") != ""]))
 
     atlas.add_text(fk_info_title, "".join(info_chars))
     atlas.add_text(fk_info_artist, "".join(info_chars))
-    atlas.add_text(fk_lyric_jp,  "".join(
-        [c for c in lyric_chars if not is_ascii_like(c)]))
-    atlas.add_text(fk_lyric_lat, "".join(
-        [c for c in lyric_chars if is_ascii_like(c)]))
+    atlas.add_text(fk_lyric_jp,  "".join([c for c in lyric_chars if not is_ascii_like(c)]))
+    atlas.add_text(fk_lyric_lat, "".join([c for c in lyric_chars if is_ascii_like(c)]))
 
     content_w = W - pad_x*2
     content_h = H - pad_y*2
@@ -1056,12 +988,12 @@ def make(
     render_lines = rres.lines
 
     # ===== OpenGL 準備 =====
-    renderer = GLRenderer(W, H, bg, STYLE)
+    renderer = GLRenderer(W,H,bg, STYLE)
     atlas_tex = atlas.finalize_gl(renderer.ctx)
     renderer.upload_atlas(atlas_tex)
 
     # ===== ジャケット =====
-    side = int(round(min(W, H) * STYLE["jacket_side_ratio"]))
+    side = int(round(min(W,H) * STYLE["jacket_side_ratio"]))
     jacket_tex = renderer.upload_jacket_image(jacket_path, side)
 
     # ===== trackName 折り返し（artist を侵食しない）=====
@@ -1069,11 +1001,11 @@ def make(
         gi = atlas.glyphs.get((fk_info_title, ch))
         return gi.advance if gi else 0.0
     info_text_w = content_w - side - info_gap_x
-    track_rows_idx = wrap_mixed_by_width(track or "", info_text_w, adv_title)
+    track = track or ""
+    track_rows_idx = wrap_mixed_by_width(track, info_text_w, adv_title)
 
     # 情報表示のテキストボックス高さ
-    track_block_h = (len(track_rows_idx) * info_title_lh + max(0, len(track_rows_idx)-1)
-                     * info_title_wrap_gap) if track_rows_idx else info_title_lh
+    track_block_h = (len(track_rows_idx) * info_title_lh + max(0, len(track_rows_idx)-1) * info_title_wrap_gap) if track_rows_idx else info_title_lh
     text_block_h = track_block_h + info_line_gap + info_artist_lh
     block_h = max(side, text_block_h)
     base_y = pad_y + (content_h - block_h)//2
@@ -1085,7 +1017,7 @@ def make(
 
     # track の各行ベースライン
     title_baselines = []
-    yb = text_box_top + STYLE["track_font_px"]
+    yb = text_box_top + track_px
     if track_rows_idx:
         for _ in range(len(track_rows_idx)):
             title_baselines.append(yb)
@@ -1093,14 +1025,13 @@ def make(
     else:
         title_baselines.append(yb)
 
-    artist_baseline_y = text_box_top + track_block_h + \
-        info_line_gap + STYLE["artist_font_px"]
+    artist_baseline_y = text_box_top + track_block_h + info_line_gap + artist_px
 
     # ===== 情報表示テキスト VBO（track 複数行 + artist）=====
     info_items = []
     if track_rows_idx:
         for row_indices, baseline in zip(track_rows_idx, title_baselines):
-            s = "".join([(track or "")[i] for i in row_indices])
+            s = "".join([ track[i] for i in row_indices ])
             info_items.append({
                 "text": s,
                 "x": int(text_left_x),
@@ -1128,44 +1059,36 @@ def make(
         row_height_for_bounds=None, record_ranges=False, baseline_to_top_px=None
     )
     renderer.text_vbo_info = vbo_info
-    renderer.img_vbo = renderer.build_jacket_geometry(
-        jacket_x, jacket_y, side, side)
+    renderer.img_vbo = renderer.build_jacket_geometry(jacket_x, jacket_y, side, side)
     renderer.jacket_tex = jacket_tex
 
     # 情報表示テキスト（シャドウ）
-    shadow_offsets = make_shadow_offsets(
-        STYLE["shadow_blur_px"], STYLE["shadow_spread_px"])
+    shadow_offsets = make_shadow_offsets(STYLE["shadow_blur_px"], STYLE["shadow_spread_px"])
     shadow_taps = len(shadow_offsets)
     shadow_per_tap_alpha = STYLE["shadow_alpha"] / max(1, shadow_taps)
 
-    # ===== 歌詞ジオメトリ（連続グラデーション：ピクセル基準の統一半幅）=====
-    lyric_items = []
+    # ===== 歌詞ジオメトリ構築（最終行フラグ埋め込み）=====
+    lyric_items=[]
     y0 = pad_y
     blur_half_px = float(STYLE["syllable_edge_blur_px"])
+    last_idx = len(render_lines)-1 if render_lines else -1
 
-    for rl in render_lines:
+    for li, rl in enumerate(render_lines):
         row_y = y0
         if rl.rows:
             for row in rl.rows:
                 s = "".join([rl.text[i] for i in row.char_indices])
-                font_keys = [(fk_lyric_lat if is_ascii_like(ch)
-                              else fk_lyric_jp) for ch in s]
-                times = [rl.char_times[i] for i in row.char_indices] if rl.char_times else [
-                    (rl.start, rl.start+0.5) for _ in row.char_indices]
+                font_keys = [(fk_lyric_lat if is_ascii_like(ch) else fk_lyric_jp) for ch in s]
+                times = [rl.char_times[i] for i in row.char_indices] if rl.char_times else [(rl.start, rl.start+0.5) for _ in row.char_indices]
 
-                syl_s0 = []
-                syl_s1 = []
-                syl_sx0 = []
-                syl_sx1 = []
-                syl_blur = []
-                syl_has = []
+                syl_s0=[]; syl_s1=[]; syl_sx0=[]; syl_sx1=[]; syl_blur=[]; syl_has=[]
 
-                # 文字 advance と累積X（文節左右端X算出用）
-                advs = []
+                # 文字 advance と累積X
+                advs=[]
                 for ch, fk in zip(s, font_keys):
                     gi = atlas.glyphs.get((fk, ch))
                     advs.append(gi.advance if gi else 0.0)
-                x_char = [0.0]
+                x_char=[0.0]
                 for a in advs[:-1]:
                     x_char.append(x_char[-1] + a)
 
@@ -1176,11 +1099,9 @@ def make(
                         g_end = g_start + 1
                         while g_end < len(times) and times[g_end] == (g_st, g_et):
                             g_end += 1
-                        # 文節のピクセル幅
                         sx0 = float(pad_x) + x_char[g_start]
                         sx1 = float(pad_x) + x_char[g_end-1] + advs[g_end-1]
                         width_px = max(1.0, sx1 - sx0)
-                        # ピクセル基準のぼかし半幅 → 文節幅で正規化（最大0.5）
                         blur_norm = min(0.5, blur_half_px / width_px)
                         for j in range(g_start, g_end):
                             syl_s0.append(g_st)
@@ -1194,15 +1115,15 @@ def make(
                     n = len(s)
                     syl_s0 = [0.0]*n
                     syl_s1 = [0.0]*n
-                    syl_sx0 = [0.0]*n
-                    syl_sx1 = [1.0]*n
-                    syl_blur = [0.0]*n
+                    syl_sx0= [0.0]*n
+                    syl_sx1= [1.0]*n
+                    syl_blur=[0.0]*n
                     syl_has = [0.0]*n
 
                 lyric_items.append({
                     "text": s,
                     "x": int(pad_x),
-                    "y": int(row_y + STYLE["lyric_font_px"]),  # baseline
+                    "y": int(row_y + lyric_px),  # baseline
                     "font_keys": font_keys,
                     "char_times": times,
                     "syl_s0": syl_s0,
@@ -1210,26 +1131,25 @@ def make(
                     "syl_sx0": syl_sx0,
                     "syl_sx1": syl_sx1,
                     "syl_blur": syl_blur,
-                    "syl_has": syl_has
+                    "syl_has": syl_has,
+                    "is_last_row": (li == last_idx)
                 })
 
-                row_y += STYLE["lyric_line_height"] + \
-                    STYLE["lyric_intra_row_gap"]
+                row_y += STYLE["lyric_line_height"] + STYLE["lyric_intra_row_gap"]
 
-        y0 += (rl.block_height if rl.rows else 0) + \
-            STYLE["lyric_inter_line_gap"]
+        y0 += (rl.block_height if rl.rows else 0) + STYLE["lyric_inter_line_gap"]
 
     vbo_lyrics = renderer.build_text_geometry(
         atlas, lyric_items,
         row_height_for_bounds=STYLE["lyric_line_height"],
         record_ranges=True,
-        baseline_to_top_px=STYLE["lyric_font_px"]
+        baseline_to_top_px=lyric_px
     )
     renderer.text_vbo_lyrics = vbo_lyrics
 
-    # ===== “重なりグループ終端待ち”のスクロールイベント列を事前計算 =====
+    # ===== “重なりグループ終端待ち”スクロールイベント =====
     inter_gap = STYLE["lyric_inter_line_gap"]
-    scroll_events = build_scroll_events_wait_all(render_lines, inter_gap)
+    scroll_events = build_scroll_events(render_lines, inter_gap)
 
     def scroll_offset_grouped(t: float) -> float:
         off = 0.0
@@ -1244,20 +1164,32 @@ def make(
         return off
 
     # ===== ディゾルブ係数（情報↔歌詞）=====
-    def alphas(tt: float) -> Tuple[float, float]:
+    def alphas(tt: float) -> Tuple[float,float]:
+        # 冒頭
         if tt < t_in:
             return 1.0, 0.0
         if t_in <= tt < t_in + fade_in_dur:
             u = (tt - t_in)/fade_in_dur
             ue = ease_in_out(u)
             return 1.0 - ue, ue
-        if tt < t_out:
+        # 中間（歌詞メイン）
+        if tt < t_info_in:
             return 0.0, 1.0
-        if t_out <= tt < t_out + fade_out_dur:
-            u = (tt - t_out)/fade_out_dur
+        # 終端：情報表示を1秒でディゾルブ（歌詞は個別制御：最終行のみフェード）
+        if t_info_in <= tt < t_info_in + info_fade_dur:
+            u = (tt - t_info_in)/info_fade_dur
             ue = ease_in_out(u)
-            return ue, 1.0 - ue
-        return 1.0, 0.0
+            return ue, 1.0  # 歌詞はこの段階で全体αは1.0（最終行は別途フェード）
+        return 1.0, 1.0
+
+    # ===== 最終行のフェードアウト係数（行単体）=====
+    def last_line_alpha(tt: float) -> float:
+        if tt < last_end_sec:
+            return 1.0
+        u = (tt - last_end_sec) / max(1e-6, last_fade_dur)
+        if u >= 1.0:
+            return 0.0
+        return 1.0 - ease_in_out(max(0.0, min(1.0, u)))
 
     # ===== ffmpeg（NVENC）=====
     ffmpeg = shutil.which("ffmpeg")
@@ -1266,8 +1198,8 @@ def make(
     out_name = f"{safe_filename(track)} - {safe_filename(artist)}.mp4"
     cmd = [
         ffmpeg, "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(
-            STYLE["output_fps"]), "-i", "-",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(STYLE["output_fps"]), "-i", "-",
+        "-itsoffset", str(STYLE["audio_delay"]),
         "-i", audio_path,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "h264_nvenc", "-preset", STYLE["nvenc_preset"],
@@ -1275,7 +1207,7 @@ def make(
         "-c:a", "aac",
         out_name
     ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=1024*1024)
 
     total_frames_out = int(round(total_sec * STYLE["output_fps"]))
     fps_in = STYLE["internal_render_fps"]
@@ -1285,33 +1217,29 @@ def make(
     start_time = time.time()
     written_out = 0
 
+    # ===== ループ =====
     t = 0.0
     for _ in range(frames_in_total):
-        info_a, lyric_a = alphas(t)
+        info_a, lyric_base_a = alphas(t)
         sc = scroll_offset_grouped(t)
+        last_a = last_line_alpha(t)
 
         renderer.begin(bg)
 
         # 情報表示（影→本体）
         if info_a > 0.001:
-            renderer.draw_image(renderer.img_vbo, renderer.jacket_tex,
-                                info_a, side, STYLE["jacket_corner_radius_px"])
-            shadow_offsets = make_shadow_offsets(
-                STYLE["shadow_blur_px"], STYLE["shadow_spread_px"])
-            shadow_taps = len(shadow_offsets)
-            shadow_per_tap_alpha = STYLE["shadow_alpha"] / max(1, shadow_taps)
-            for dx, dy in shadow_offsets:
-                renderer.draw_text_full(renderer.text_vbo_info, shadow_per_tap_alpha,
-                                        0.0, 0.0, static=True, offset=(dx, dy), shadow=True)
-            renderer.draw_text_full(
-                renderer.text_vbo_info, info_a, 0.0, 0.0, static=True)
+            renderer.draw_image(renderer.img_vbo, renderer.jacket_tex, info_a, side, STYLE["jacket_corner_radius_px"])
+            for dx,dy in shadow_offsets:
+                renderer.draw_text_full(renderer.text_vbo_info, shadow_per_tap_alpha, 0.0, 0.0, static=True, offset=(dx,dy), shadow=True)
+            renderer.draw_text_full(renderer.text_vbo_info, info_a, 0.0, 0.0, static=True)
 
-        # 歌詞（外枠全体を可視範囲としてカリング）
-        if lyric_a > 0.001:
+        # 歌詞（全体αは lyric_base_a、最終行のみ last_a を掛け合わせる）
+        if lyric_base_a > 0.001:
             renderer.draw_text_culled(
-                renderer.text_vbo_lyrics, lyric_a, t, sc,
+                renderer.text_vbo_lyrics, lyric_base_a, t, sc,
                 y_clip_min=0, y_clip_max=H,
-                overscan=STYLE["lyric_line_height"]
+                overscan=STYLE["lyric_line_height"],
+                last_row_alpha=last_a
             )
 
         rgb = renderer.read_rgb()
@@ -1325,10 +1253,8 @@ def make(
         elapsed = time.time() - start_time
         progress = written_out / max(1, total_frames_out)
         fps_est = (written_out / elapsed) if elapsed > 0 else 0.0
-        eta = (total_frames_out - written_out) / \
-            fps_est if fps_est > 0 else 0.0
-        print(
-            f"\rProgress: {written_out}/{total_frames_out} frames ({progress*100:5.1f}%) | {fps_est:5.1f} fps | ETA {eta:6.1f}s", end="")
+        eta = (total_frames_out - written_out) / fps_est if fps_est > 0 else 0.0
+        print(f"\rProgress: {written_out}/{total_frames_out} frames ({progress*100:5.1f}%) | {fps_est:5.1f} fps | ETA {eta:6.1f}s", end="")
 
         if written_out >= total_frames_out:
             break
@@ -1343,12 +1269,9 @@ def make(
 # =========================
 # CLI
 # =========================
-
-
 def _cli():
     if len(sys.argv) < 5:
-        print(
-            "Usage: python lyricVideo.py <audio.wav> <lyrics.json> <jacket.jpg> <info.json> [WxH]")
+        print("Usage: python lyricVideo.py <audio.wav> <lyrics.json> <jacket.jpg> <info.json> [WxH]")
         sys.exit(1)
     audio_path = sys.argv[1]
     lyric_path = sys.argv[2]
@@ -1356,7 +1279,6 @@ def _cli():
     info_path = sys.argv[4]
     res = sys.argv[5] if len(sys.argv) >= 6 else "1920x1080"
     make(audio_path, lyric_path, jacket_path, info_path, res)
-
 
 if __name__ == "__main__":
     _cli()
