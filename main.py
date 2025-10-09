@@ -70,8 +70,8 @@ STYLE_DEFAULT = {
     ],
 
     # box-shadow 近似
-    "shadow_blur_px": 50.0,
-    "shadow_spread_px": 1,
+    "shadow_blur_px": 30.0,
+    "shadow_spread_px": 2.5,
     "shadow_alpha": 0.25,
     
     "audio_delay" : 0.3
@@ -114,7 +114,8 @@ def avg_color_with_clamp(jacket_path: str) -> Tuple[int,int,int]:
     img = Image.open(jacket_path).convert("RGB")
     stat = ImageStat.Stat(img)
     r, g, b = stat.mean
-    return clamp_int(r,50,230), clamp_int(g,50,230), clamp_int(b,50,230)
+    c_min, c_max = 30, 200
+    return clamp_int(r, c_min, c_max), clamp_int(g, c_min, c_max), clamp_int(b, c_min, c_max)
 
 def cubic_bezier(x: float, x1: float, y1: float, x2: float, y2: float) -> float:
     def bez(u, a, b): return 3*(1-u)*(1-u)*u*a + 3*(1-u)*u*u*b + u*u*u
