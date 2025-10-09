@@ -12,8 +12,8 @@ import freetype
 # スタイル（既定値／1920x1080基準）
 # =========================
 STYLE_DEFAULT = {
-    "output_fps": 30,
-    "internal_render_fps": 30,
+    "output_fps": 60,
+    "internal_render_fps": 60,
 
     # パディング（解像度に相対：左右=100, 上下=150）
     "pad_x_base": 100,   # ←→
@@ -32,9 +32,9 @@ STYLE_DEFAULT = {
     "lyric_font_px": 120,
 
     # 歌詞レイアウト（固定px）
-    "lyric_line_height": 200,
+    "lyric_line_height": 150,
     "lyric_intra_row_gap": 10,    # 同一 words 内の折返し行間
-    "lyric_inter_line_gap": 75,  # 別 words 間の行間
+    "lyric_inter_line_gap": 125,  # 別 words 間の行間
 
     # ジャケット
     "jacket_corner_radius_px": 20,
@@ -272,11 +272,16 @@ class RenderRow:
         self.width=width
 
 class RenderLine:
-    def __init__(self,idx:int,start:float,end:float,text:str,has_syll:bool):
-        self.index=idx; self.start=start; self.end=end; self.text=text; self.has_syll=has_syll
-        self.rows:List[RenderRow]=[]
-        self.block_height:int=0
-        self.char_times:List[Tuple[float,float]]=[]  # 各文字の (start,end)
+    def __init__(self, idx:int, start:float, end:float, text:str, has_syll:bool):
+        self.index = idx
+        self.start = start
+        self.end = end
+        self.text = text
+        self.has_syll = has_syll
+        self.rows: List[RenderRow] = []
+        self.block_height: int = 0
+        self.char_times: List[Tuple[float,float]] = []
+        self.syllable_spans: List[Tuple[int,int,float,float]] = []
 
 # =========================
 # Shaders（文節マスク連続グラデーション）
@@ -585,6 +590,7 @@ def build_render_lines(
                         st, et = s, e
                         break
                 rl.char_times.append((st, et))
+            rl.syllable_spans = spans
         elif text != "":
             rl.char_times = [(start, start+0.5) for _ in range(len(text))]
         else:
@@ -606,6 +612,47 @@ def build_render_lines(
         render_lines.append(rl)
 
     return RenderBuildResult(render_lines, lh)
+
+def _adjust_times_for_wrapped_syllables(rl: "RenderLine", row_indices: List[int], times: List[Tuple[float,float]]) -> List[Tuple[float,float]]:
+    """
+    文節の途中で改行が起きた場合にのみ、当該“行内サブ区間”の時間窓を
+    (s + per*(local_start - a), s + per*(local_end - a)) に置き換える。
+    - rl.syllable_spans: [(a, b, s, e)]  文節の全体範囲（文字index）と時間
+    - row_indices:      現在行に載っているグローバル文字index（連続範囲）
+    - times:            現在行の各文字に割り当て済みの (start,end) （ベース）
+    戻り値は、行内連続サブ区間の文字に同一の (start,end) を揃えて返す。
+    """
+    if not rl.has_syll or not rl.syllable_spans or not row_indices:
+        return times
+
+    first = row_indices[0]
+    last_ex = row_indices[-1] + 1  # exclusive
+    out = list(times)
+
+    for a, b, s, e in rl.syllable_spans:
+        # 行と文節の交差範囲 [rs, re)
+        rs = max(a, first)
+        re = min(b, last_ex)
+        if rs >= re:
+            continue  # 交差なし
+        # 「文節の前後でなく、文節中で改行が発生」しているか？
+        # すなわち、当該交差が文節全体(a..b)と一致していない場合のみ按分を適用
+        is_split_inside = not (rs == a and re == b)
+        if not is_split_inside:
+            continue
+
+        total = max(1, b - a)
+        per = (e - s) / total
+        seg_start = s + per * (rs - a)
+        seg_end   = s + per * (re - a)
+
+        # 行内ローカルindexに変換して一括置換
+        l0 = rs - first
+        l1 = re - first
+        for li in range(l0, l1):
+            out[li] = (seg_start, seg_end)
+
+    return out
 
 # =========================
 # OpenGL Renderer
@@ -885,7 +932,9 @@ def make(
     jacket_path: str,
     info_path: str,
     resolution: str = "1920x1080",
-    style_overrides: Optional[Dict[str, float]] = None
+    style_overrides: Optional[Dict[str, float]] = None,
+    output_dir: Optional[str] = None,
+    thumbnail_dir: Optional[str] = None
 ) -> str:
     STYLE = dict(STYLE_DEFAULT)
     if style_overrides:
@@ -905,6 +954,15 @@ def make(
         info_data = json.load(f)
     track = info_data.get("trackName","Unknown Track")
     artist = info_data.get("artistName","Unknown Artist")
+    
+    base_name = f"{safe_filename(track)} - {safe_filename(artist)}"
+    out_dir = output_dir or os.getcwd()
+    thumb_dir = thumbnail_dir or out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(thumb_dir, exist_ok=True)
+
+    video_path = os.path.join(out_dir, base_name + ".mp4")
+    thumb_path = os.path.join(thumb_dir, base_name + ".png")
 
     audio_sec = ffprobe_duration_seconds(audio_path)
     first_start_ms = min([ln.get("startTimeMs",0) for ln in lyric_data]) if lyric_data else 0
@@ -1080,6 +1138,9 @@ def make(
                 s = "".join([rl.text[i] for i in row.char_indices])
                 font_keys = [(fk_lyric_lat if is_ascii_like(ch) else fk_lyric_jp) for ch in s]
                 times = [rl.char_times[i] for i in row.char_indices] if rl.char_times else [(rl.start, rl.start+0.5) for _ in row.char_indices]
+                
+                if rl.has_syll and rl.syllable_spans:
+                    times = _adjust_times_for_wrapped_syllables(rl, row.char_indices, times)
 
                 syl_s0=[]; syl_s1=[]; syl_sx0=[]; syl_sx1=[]; syl_blur=[]; syl_has=[]
 
@@ -1205,7 +1266,7 @@ def make(
         "-c:v", "h264_nvenc", "-preset", STYLE["nvenc_preset"],
         *STYLE["nvenc_params"],
         "-c:a", "aac",
-        out_name
+        video_path
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=1024*1024)
 
@@ -1263,7 +1324,8 @@ def make(
     print("")
     proc.stdin.close()
     proc.wait()
-    # --- ここから追記: 最後の情報表示をPNGでサムネイル保存 ---
+    
+    # サムネイル生成
     thumb_name = f"{safe_filename(track)} - {safe_filename(artist)}.png"
 
     # 背景を塗り直し、情報表示のみをフル不透明で描画
@@ -1275,8 +1337,8 @@ def make(
 
     # フレーム読み出し→PNG保存
     rgb = renderer.read_rgb()  # 既存がRGB24を返す前提
-    Image.frombytes("RGB", (W, H), rgb).save(thumb_name, "PNG")
-    print(f"Thumbnail saved: {thumb_name}")
+    Image.frombytes("RGB", (W, H), rgb).save(thumb_path, "PNG")
+    print(f"Thumbnail saved: {thumb_path}")
     # --- 追記ここまで ---
 
     print(f"Done: {out_name}")
@@ -1287,14 +1349,18 @@ def make(
 # =========================
 def _cli():
     if len(sys.argv) < 5:
-        print("Usage: python lyricVideo.py <audio.wav> <lyrics.json> <jacket.jpg> <info.json> [WxH]")
+        print("Usage: python lyricVideo.py <audio.wav> <lyrics.json> <jacket.jpg> <info.json> [WxH] [output_dir] [thumbnail_dir]")
         sys.exit(1)
     audio_path = sys.argv[1]
     lyric_path = sys.argv[2]
     jacket_path = sys.argv[3]
     info_path = sys.argv[4]
     res = sys.argv[5] if len(sys.argv) >= 6 else "1920x1080"
-    make(audio_path, lyric_path, jacket_path, info_path, res)
+    out_dir = sys.argv[6] if len(sys.argv) >= 7 else None
+    thumb_dir = sys.argv[7] if len(sys.argv) >= 8 else None
+
+    make(audio_path, lyric_path, jacket_path, info_path, res,
+         output_dir=out_dir, thumbnail_dir=thumb_dir)
 
 if __name__ == "__main__":
     _cli()

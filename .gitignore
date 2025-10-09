@@ -2,4 +2,6 @@
 *.jpg
 *.wav
 *.mp4
+*.png
 venv
+media-user-token
