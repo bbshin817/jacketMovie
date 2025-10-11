@@ -49,7 +49,7 @@ STYLE_DEFAULT = {
     "last_line_fade_sec": 1.0,
 
     # 文節グラデーション境界の半幅（ピクセル）← 統一幅
-    "syllable_edge_blur_px": 75.0,
+    "syllable_edge_blur_px": 30.0,
 
     # NVENC
     "nvenc_preset": "p1",
@@ -74,7 +74,7 @@ STYLE_DEFAULT = {
     "shadow_spread_px": 2.5,
     "shadow_alpha": 0.25,
     
-    "audio_delay" : 0.3
+    "audio_delay" : 0.2
 }
 
 # プロジェクト直下の "fonts" ディレクトリを優先して探索
@@ -1260,74 +1260,49 @@ def make(
     out_name = f"{safe_filename(track)} - {safe_filename(artist)}.mp4"
     cmd = [
         ffmpeg, "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(STYLE["output_fps"]), "-i", "-",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
+        "-framerate", str(STYLE["output_fps"]), "-i", "-",  # ★ ここを -framerate に
         "-itsoffset", str(STYLE["audio_delay"]),
         "-i", audio_path,
+        "-vsync", "cfr",        # ★ CFR 明示
+        "-fps_mode", "cfr",     # ★ CFR 明示（mp4の時系列安定化）
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "h264_nvenc", "-preset", STYLE["nvenc_preset"],
         *STYLE["nvenc_params"],
         "-c:a", "aac",
         video_path
     ]
+
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=1024*1024)
 
     total_frames_out = int(round(total_sec * STYLE["output_fps"]))
-    fps_in = STYLE["internal_render_fps"]
-    duplicate = max(1, int(round(STYLE["output_fps"] / fps_in)))
-    frames_in_total = int(math.ceil(total_sec * fps_in))
-    t_step = 1.0 / fps_in
     start_time = time.time()
-    written_out = 0
-
-    # ===== ループ =====
-    t = 0.0
-    for _ in range(frames_in_total):
-        info_a, lyric_base_a = alphas(t)
+    for n in range(total_frames_out):
+        t = n / STYLE["output_fps"]  # ★ 常に出力FPS基準の正確な時刻
+        info_a, lyric_a = alphas(t)
         sc = scroll_offset_grouped(t)
-        last_a = last_line_alpha(t)
 
         renderer.begin(bg)
-
-        # 情報表示（影→本体）
         if info_a > 0.001:
             renderer.draw_image(renderer.img_vbo, renderer.jacket_tex, info_a, side, STYLE["jacket_corner_radius_px"])
-            for dx,dy in shadow_offsets:
-                renderer.draw_text_full(renderer.text_vbo_info, shadow_per_tap_alpha, 0.0, 0.0, static=True, offset=(dx,dy), shadow=True)
+            for dx, dy in shadow_offsets:
+                renderer.draw_text_full(renderer.text_vbo_info, shadow_per_tap_alpha, 0.0, 0.0, static=True, offset=(dx, dy), shadow=True)
             renderer.draw_text_full(renderer.text_vbo_info, info_a, 0.0, 0.0, static=True)
-
-        # 歌詞（全体αは lyric_base_a、最終行のみ last_a を掛け合わせる）
-        if lyric_base_a > 0.001:
-            renderer.draw_text_culled(
-                renderer.text_vbo_lyrics, lyric_base_a, t, sc,
-                y_clip_min=0, y_clip_max=H,
-                overscan=STYLE["lyric_line_height"],
-                last_row_alpha=last_a
-            )
+        if lyric_a > 0.001:
+            renderer.draw_text_culled(renderer.text_vbo_lyrics, lyric_a, t, sc, y_clip_min=0, y_clip_max=H, overscan=STYLE["lyric_line_height"])
 
         rgb = renderer.read_rgb()
-        for _dup in range(duplicate):
-            if written_out >= total_frames_out:
-                break
-            proc.stdin.write(rgb)
-            written_out += 1
+        proc.stdin.write(rgb)
 
-        # 進捗表示
+        # 進捗
         elapsed = time.time() - start_time
-        progress = written_out / max(1, total_frames_out)
-        fps_est = (written_out / elapsed) if elapsed > 0 else 0.0
-        eta = (total_frames_out - written_out) / fps_est if fps_est > 0 else 0.0
-        print(f"\rProgress: {written_out}/{total_frames_out} frames ({progress*100:5.1f}%) | {fps_est:5.1f} fps | ETA {eta:6.1f}s", end="")
-
-        if written_out >= total_frames_out:
-            break
-        t += t_step
+        fps_est = (n + 1) / elapsed if elapsed > 0 else 0.0
+        eta = (total_frames_out - (n + 1)) / fps_est if fps_est > 0 else 0.0
+        print(f"\rProgress: {n+1}/{total_frames_out} frames ({(n+1)*100/total_frames_out:5.1f}%) | {fps_est:5.1f} fps | ETA {eta:6.1f}s", end="")
 
     print("")
     proc.stdin.close()
     proc.wait()
-    
-    # サムネイル生成
-    thumb_name = f"{safe_filename(track)} - {safe_filename(artist)}.png"
 
     # 背景を塗り直し、情報表示のみをフル不透明で描画
     renderer.begin(bg)
@@ -1340,7 +1315,18 @@ def make(
     rgb = renderer.read_rgb()  # 既存がRGB24を返す前提
     Image.frombytes("RGB", (W, H), rgb).save(thumb_path, "PNG")
     print(f"Thumbnail saved: {thumb_path}")
-    # --- 追記ここまで ---
+    
+    # GL リソース解放（存在チェック付き）
+    for obj in [renderer.atlas_tex, renderer.jacket_tex, renderer.text_vbo_info, renderer.text_vbo_lyrics, renderer.img_vbo]:
+        if obj is not None and hasattr(obj, "release"):
+            obj.release()
+    if hasattr(renderer, "ctx") and hasattr(renderer.ctx, "release"):
+        renderer.ctx.release()
+    if hasattr(renderer, "window"):
+        try:
+            renderer.window.close()
+        except Exception:
+            pass
 
     print(f"Done: {out_name}")
     return out_name

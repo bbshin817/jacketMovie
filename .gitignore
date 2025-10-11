@@ -3,5 +3,6 @@
 *.wav
 *.mp4
 *.png
+*.m4a
 venv
 media-user-token
