@@ -1276,29 +1276,51 @@ def make(
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=1024*1024)
 
     total_frames_out = int(round(total_sec * STYLE["output_fps"]))
+    fps_in = STYLE["internal_render_fps"]
+    duplicate = max(1, int(round(STYLE["output_fps"] / fps_in)))
+    frames_in_total = int(math.ceil(total_sec * fps_in))
+    t_step = 1.0 / fps_in
     start_time = time.time()
-    for n in range(total_frames_out):
-        t = n / STYLE["output_fps"]  # ★ 常に出力FPS基準の正確な時刻
-        info_a, lyric_a = alphas(t)
+    written_out = 0
+
+    # ===== ループ =====
+    t = 0.0
+    for _ in range(frames_in_total):
+        info_a, lyric_base_a = alphas(t)
         sc = scroll_offset_grouped(t)
+        last_a = last_line_alpha(t)
 
         renderer.begin(bg)
         if info_a > 0.001:
             renderer.draw_image(renderer.img_vbo, renderer.jacket_tex, info_a, side, STYLE["jacket_corner_radius_px"])
-            for dx, dy in shadow_offsets:
-                renderer.draw_text_full(renderer.text_vbo_info, shadow_per_tap_alpha, 0.0, 0.0, static=True, offset=(dx, dy), shadow=True)
+            for dx,dy in shadow_offsets:
+                renderer.draw_text_full(renderer.text_vbo_info, shadow_per_tap_alpha, 0.0, 0.0, static=True, offset=(dx,dy), shadow=True)
             renderer.draw_text_full(renderer.text_vbo_info, info_a, 0.0, 0.0, static=True)
-        if lyric_a > 0.001:
-            renderer.draw_text_culled(renderer.text_vbo_lyrics, lyric_a, t, sc, y_clip_min=0, y_clip_max=H, overscan=STYLE["lyric_line_height"])
+        if lyric_base_a > 0.001:
+            renderer.draw_text_culled(
+                renderer.text_vbo_lyrics, lyric_base_a, t, sc,
+                y_clip_min=0, y_clip_max=H,
+                overscan=STYLE["lyric_line_height"],
+                last_row_alpha=last_a
+            )
 
         rgb = renderer.read_rgb()
-        proc.stdin.write(rgb)
+        for _dup in range(duplicate):
+            if written_out >= total_frames_out:
+                break
+            proc.stdin.write(rgb)
+            written_out += 1
 
         # 進捗
         elapsed = time.time() - start_time
-        fps_est = (n + 1) / elapsed if elapsed > 0 else 0.0
-        eta = (total_frames_out - (n + 1)) / fps_est if fps_est > 0 else 0.0
-        print(f"\rProgress: {n+1}/{total_frames_out} frames ({(n+1)*100/total_frames_out:5.1f}%) | {fps_est:5.1f} fps | ETA {eta:6.1f}s", end="")
+        progress = written_out / max(1, total_frames_out)
+        fps_est = (written_out / elapsed) if elapsed > 0 else 0.0
+        eta = (total_frames_out - written_out) / fps_est if fps_est > 0 else 0.0
+        print(f"\rProgress: {written_out}/{total_frames_out} frames ({progress*100:5.1f}%) | {fps_est:5.1f} fps | ETA {eta:6.1f}s", end="")
+
+        if written_out >= total_frames_out:
+            break
+        t += t_step
 
     print("")
     proc.stdin.close()
