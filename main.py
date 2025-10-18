@@ -74,7 +74,22 @@ STYLE_DEFAULT = {
     "shadow_spread_px": 2.5,
     "shadow_alpha": 0.25,
     
-    "audio_delay" : 0.2
+    "audio_delay" : 0.2,
+    
+    "font_priority": {
+        "info": [
+            ["GoogleSansMedium.woff2", "GoogleSans-Medium.ttf", "GoogleSans-Medium.otf", "GoogleSans.ttf"],
+            ["UDkakugo.woff2", "UDkakugo.ttf", "UDkakugo.otf", "UDKakugo-Regular.ttf"],
+            ["NotoSansKR-Medium.otf"],
+            ["Xim-Sans-Handwritten.ttf"]
+        ],
+        "lyrics": [
+            ["GoogleSansMedium.woff2", "GoogleSans-Medium.ttf", "GoogleSans-Medium.otf", "GoogleSans.ttf"],
+            ["hirakaku_w6.woff2", "hirakaku_w6.ttf", "HiraginoSans-W6.otf", "HiraginoKakuGothic-W6.otf"],
+            ["NotoSansKR-Medium.otf"],
+            ["Xim-Sans-Handwritten.ttf"]
+        ]
+    }
 }
 
 # プロジェクト直下の "fonts" ディレクトリを優先して探索
@@ -160,6 +175,51 @@ def ensure_ttf(font_path: str) -> Optional[str]:
             return None
     return None
 
+_face_cache: Dict[str, freetype.Face] = {}
+
+def _get_face(path: str) -> Optional[freetype.Face]:
+    if not path:
+        return None
+    if path in _face_cache:
+        return _face_cache[path]
+    try:
+        face = freetype.Face(path)
+        _face_cache[path] = face
+        return face
+    except Exception:
+        return None
+
+def _can_render(path: str, ch: str) -> bool:
+    face = _get_face(path)
+    if not face:
+        return False
+    return face.get_char_index(ord(ch)) != 0
+
+# ★ 追加: セクション("info"/"lyrics")×1文字に対し、優先度レベルを順に降下して解決
+def resolve_font_path_for_char(style: Dict, section: str, ch: str) -> Optional[str]:
+    layers = (style.get("font_priority") or {}).get(section, [])
+    for level in layers:             # レベル0 → 1 → 2 …
+        for name in level:           # 同一レベル内は左から順に
+            p = _pick_font([name])   # /fonts 優先 & woff2→ttf 変換
+            if p and _can_render(p, ch):
+                return p
+    return None
+
+# ★ 追加: 文字が描けなくても「開けるフォント」を最終的に返す救済（クラッシュ回避）
+def resolve_any_openable_font(style: Dict, section: str) -> Optional[str]:
+    layers = (style.get("font_priority") or {}).get(section, [])
+    for level in layers:
+        for name in level:
+            p = _pick_font([name])
+            if p and _get_face(p):    # 開けるかどうかのみ確認
+                return p
+    # さらに最後の最後に一般候補を試す
+    for cand in ["fonts/DejaVuSans.ttf", "DejaVuSans.ttf", "fonts/NotoSans-Regular.ttf", "fonts/NotoSansCJKjp-Regular.otf"]:
+        p = _pick_font([cand])
+        if p and _get_face(p):
+            return p
+    return None
+
 def ffprobe_duration_seconds(path: str) -> float:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
@@ -233,18 +293,31 @@ class FontAtlas:
         self.glyphs: Dict[Tuple["FontKey",str], GlyphInfo] = {}
         self.packer = AtlasPacker()
         self.faces: Dict["FontKey", freetype.Face] = {}
-    def _load_face(self,key:"FontKey")->freetype.Face:
+    def _load_face(self,key:"FontKey")->Optional[freetype.Face]:
         if key in self.faces: return self.faces[key]
-        face=freetype.Face(key.path)
-        face.set_char_size(key.size*64)
-        self.faces[key]=face
-        return face
+        try:
+            if not key.path or not os.path.isfile(key.path):
+                return None
+            face = freetype.Face(key.path)
+            face.set_char_size(key.size*64)
+            self.faces[key] = face
+            return face
+        except Exception as e:
+            print(f"[warn] FreeType open failed for {key.path}: {e}")
+            return None
     def add_text(self,key:"FontKey",text:str):
-        face=self._load_face(key)
+        face = self._load_face(key)
+        if face is None:
+            # フォントが開けない場合は安全にスキップ（以降の処理でクラッシュしません）
+            return
         for ch in text:
             k=(key,ch)
             if k in self.glyphs: continue
-            face.load_char(ch, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_NORMAL)
+            try:
+                face.load_char(ch, freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_NORMAL)
+            except Exception:
+                # 未対応グリフなどはスキップ（クラッシュしません）
+                continue
             glyph=face.glyph
             bmp=glyph.bitmap
             w,h=bmp.width,bmp.rows
@@ -253,7 +326,7 @@ class FontAtlas:
                 self.glyphs[k]=gi
                 continue
             buf=np.array(bmp.buffer,dtype=np.uint8).reshape((h,w))
-            im=Image.fromarray(buf)  # mode 省略（Deprecation回避）
+            im=Image.fromarray(buf)
             x,y=self.packer.add_bitmap(im)
             u0,v0,u1,v1 = x/self.packer.W, y/self.packer.H, (x+w)/self.packer.W, (y+h)/self.packer.H
             gi=GlyphInfo(u0,v0,u1,v1,w,h,glyph.bitmap_left,glyph.bitmap_top,glyph.advance.x/64.0)
@@ -551,18 +624,22 @@ def build_render_lines(
     jp_key: "FontKey",
     lat_key: "FontKey",
     content_w: int,
-    style: Dict[str, float]
+    style: Dict[str, float],
+    choose_key_fn: Optional[callable] = None   # ★追加
 ) -> RenderBuildResult:
 
     lh = style["lyric_line_height"]
     gap_intra = style["lyric_intra_row_gap"]
 
     def char_key(c: str) -> "FontKey":
+        if choose_key_fn:
+            return choose_key_fn(c)  # ★実フォントで評価
         return lat_key if is_ascii_like(c) else jp_key
 
     def char_advance(c: str) -> float:
         gi = atlas.glyphs.get((char_key(c), c))
         return gi.advance if gi else 0.0
+
 
     render_lines: List[RenderLine] = []
 
@@ -1006,31 +1083,48 @@ def make(
 
     bg = avg_color_with_clamp(jacket_path)
 
-    info_font_path = _pick_font([
-        "UDkakugo.woff2", "UDkakugo.ttf", "UDkakugo.otf", "UDKakugo-Regular.ttf"
-    ]) or "DejaVuSans.ttf"
-
-    jp_font_path = _pick_font([
-        "hirakaku_w6.woff2", "hirakaku_w6.ttf", "HiraginoSans-W6.otf", "HiraginoKakuGothic-W6.otf"
-    ]) or "DejaVuSans.ttf"
-
-    lat_font_path = _pick_font([
-        "GoogleSansMedium.woff2", "GoogleSans-Medium.ttf", "GoogleSans-Medium.otf", "GoogleSans.ttf"
-    ]) or "DejaVuSans.ttf"
-
+    # ★置換: 文字ごとにセクション別優先度から解決して FontKey を作成・キャッシュ
     atlas = FontAtlas()
-    fk_info_title = FontKey(info_font_path, track_px)
-    fk_info_artist= FontKey(info_font_path, artist_px)
-    fk_lyric_jp   = FontKey(jp_font_path,   lyric_px)
-    fk_lyric_lat  = FontKey(lat_font_path,  lyric_px)
+    _fk_cache: Dict[Tuple[str, int], FontKey] = {}  # (path,size) → FontKey
 
-    info_chars = set((track or "") + (artist or ""))
-    lyric_chars = set("".join([ln.get("words","") for ln in lyric_data if ln.get("words","") != ""]))
+    def _fk(path: str, size_px: int) -> "FontKey":
+        key = (path, size_px)
+        if key in _fk_cache:
+            return _fk_cache[key]
+        k = FontKey(path, size_px)
+        _fk_cache[key] = k
+        return k
 
-    atlas.add_text(fk_info_title, "".join(info_chars))
-    atlas.add_text(fk_info_artist, "".join(info_chars))
-    atlas.add_text(fk_lyric_jp,  "".join([c for c in lyric_chars if not is_ascii_like(c)]))
-    atlas.add_text(fk_lyric_lat, "".join([c for c in lyric_chars if is_ascii_like(c)]))
+    # ★ 置換: 固定 "DejaVuSans.ttf" を廃止。描画可フォント→開けるフォントの順で解決
+    def info_key_for(ch: str, is_title: bool) -> "FontKey":
+        p = resolve_font_path_for_char(STYLE, "info", ch)
+        if not p:
+            p = resolve_any_openable_font(STYLE, "info")
+        if not p:
+            p = resolve_any_openable_font(STYLE, "lyrics")  # セクション跨ぎ救済
+        if not p:
+            p = ""  # 最終手段：add_text 側で安全にスキップされ、クラッシュしません
+        return _fk(p, track_px if is_title else artist_px)
+
+    def lyric_key_for(ch: str) -> "FontKey":
+        p = resolve_font_path_for_char(STYLE, "lyrics", ch)
+        if not p:
+            p = resolve_any_openable_font(STYLE, "lyrics")
+        if not p:
+            p = resolve_any_openable_font(STYLE, "info")     # 逆方向救済
+        if not p:
+            p = ""
+        return _fk(p, lyric_px)
+
+    # ★アトラス登録：track / artist / lyrics を“実際に使うフォント”で都度追加
+    for ch in (track or ""):
+        atlas.add_text(info_key_for(ch, True), ch)
+    for ch in (artist or ""):
+        atlas.add_text(info_key_for(ch, False), ch)
+    for ln in lyric_data:
+        for ch in ln.get("words", ""):
+            atlas.add_text(lyric_key_for(ch), ch)
+
 
     content_w = W - pad_x*2
     content_h = H - pad_y*2
@@ -1039,11 +1133,13 @@ def make(
     rres = build_render_lines(
         lyric_json=lyric_data,
         atlas=atlas,
-        jp_key=fk_lyric_jp,
-        lat_key=fk_lyric_lat,
+        jp_key=None,  # ダミー（choose_key_fn が使われるため未使用）
+        lat_key=None, # ダミー
         content_w=content_w,
-        style=STYLE
+        style=STYLE,
+        choose_key_fn=lyric_key_for
     )
+
     render_lines = rres.lines
 
     # ===== OpenGL 準備 =====
@@ -1057,7 +1153,7 @@ def make(
 
     # ===== trackName 折り返し（artist を侵食しない）=====
     def adv_title(ch: str) -> float:
-        gi = atlas.glyphs.get((fk_info_title, ch))
+        gi = atlas.glyphs.get((info_key_for(ch, True), ch))
         return gi.advance if gi else 0.0
     info_text_w = content_w - side - info_gap_x
     track = track or ""
@@ -1095,22 +1191,22 @@ def make(
                 "text": s,
                 "x": int(text_left_x),
                 "y": int(baseline),
-                "font_key": fk_info_title,
+                "font_keys": [info_key_for(ch, True) for ch in s],  # ★変更
                 "char_times": None
             })
     else:
         info_items.append({
-            "text": track or " ",
-            "x": int(text_left_x),
-            "y": int(title_baselines[0]),
-            "font_key": fk_info_title,
-            "char_times": None
-        })
+			"text": track or " ",
+			"x": int(text_left_x),
+			"y": int(artist_baseline_y),
+			"font_keys": [info_key_for(ch, False) for ch in (artist or " ")],  # ★変更
+			"char_times": None
+		})
     info_items.append({
         "text": artist or " ",
         "x": int(text_left_x),
         "y": int(artist_baseline_y),
-        "font_key": fk_info_artist,
+        "font_keys": [info_key_for(ch, False) for ch in (artist or " ")],  # ★変更
         "char_times": None
     })
     vbo_info = renderer.build_text_geometry(
@@ -1137,7 +1233,7 @@ def make(
         if rl.rows:
             for row in rl.rows:
                 s = "".join([rl.text[i] for i in row.char_indices])
-                font_keys = [(fk_lyric_lat if is_ascii_like(ch) else fk_lyric_jp) for ch in s]
+                font_keys = [lyric_key_for(ch) for ch in s]  # ★変更
                 times = [rl.char_times[i] for i in row.char_indices] if rl.char_times else [(rl.start, rl.start+0.5) for _ in row.char_indices]
                 
                 if rl.has_syll and rl.syllable_spans:
